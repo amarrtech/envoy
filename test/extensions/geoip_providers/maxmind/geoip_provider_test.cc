@@ -1,3 +1,5 @@
+#include <functional>
+
 #include "envoy/extensions/geoip_providers/maxmind/v3/maxmind.pb.h"
 #include "envoy/registry/registry.h"
 
@@ -174,6 +176,9 @@ public:
                   on_changed_cbs_.reserve(1);
                   on_changed_cbs_.emplace_back(std::move(cb));
                 }
+                if (on_add_watch_) {
+                  on_add_watch_();
+                }
                 if (conditional.has_value()) {
                   conditional->setReady();
                 }
@@ -227,6 +232,7 @@ public:
   absl::flat_hash_map<std::string, std::string> captured_lookup_response_;
   absl::Mutex mutex_;
   std::vector<Filesystem::Watcher::OnChangedCb> on_changed_cbs_ ABSL_GUARDED_BY(mutex_);
+  std::function<void()> on_add_watch_;
   std::optional<ConditionalInitializer> cb_added_nullopt = std::nullopt;
   DriverSharedPtr provider_;
 
@@ -1055,6 +1061,54 @@ TEST_F(GeoipProviderTest, AllowsMissingDatabaseAndLoadsItWhenItAppears) {
   provider_->lookup(std::move(second_lookup_request), std::move(second_lookup_cb_std));
   EXPECT_EQ("London", captured_lookup_response_["x-geo-city"]);
   expectStats("city_db", 2, 1, 1);
+}
+
+TEST_F(GeoipProviderTest, LoadsDatabaseCreatedDuringWatcherRegistration) {
+  const std::string missing_db_path = TestEnvironment::temporaryPath("watch-race-city.mmdb");
+  const std::string config_yaml = absl::StrFormat(R"EOF(
+    common_provider_config:
+      geo_field_keys:
+        city: "x-geo-city"
+    city_db_path: "%s"
+    allow_missing_database: true
+  )EOF",
+                                                  missing_db_path);
+  on_add_watch_ = [&] {
+    TestEnvironment::writeStringToFileForTest(
+        missing_db_path,
+        TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(default_city_db_path)),
+        true);
+  };
+
+  initializeProvider(config_yaml, cb_added_nullopt);
+  expectReloadStats("city_db");
+
+  Network::Address::InstanceConstSharedPtr remote_address =
+      Network::Utility::parseInternetAddressNoThrow("81.2.69.144");
+  Geolocation::LookupRequest lookup_request{std::move(remote_address)};
+  testing::MockFunction<void(Geolocation::LookupResult&&)> lookup_cb;
+  auto lookup_cb_std = lookup_cb.AsStdFunction();
+  EXPECT_CALL(lookup_cb, Call(_)).WillOnce(SaveArg<0>(&captured_lookup_response_));
+  provider_->lookup(std::move(lookup_request), std::move(lookup_cb_std));
+  EXPECT_EQ("London", captured_lookup_response_["x-geo-city"]);
+  expectStats("city_db");
+}
+
+TEST_F(GeoipProviderTest, AllowMissingDatabaseRejectsNonMissingFileOpenError) {
+  const std::string regular_file_path = TestEnvironment::temporaryPath("not-a-directory");
+  TestEnvironment::writeStringToFileForTest(regular_file_path, "not a directory");
+  const std::string db_path = absl::StrCat(regular_file_path, "/city.mmdb");
+  const std::string config_yaml = absl::StrFormat(R"EOF(
+    common_provider_config:
+      geo_field_keys:
+        city: "x-geo-city"
+    city_db_path: "%s"
+    allow_missing_database: true
+  )EOF",
+                                                  db_path);
+
+  EXPECT_THROW_WITH_REGEX(initializeProvider(config_yaml, cb_added_nullopt), EnvoyException,
+                          "Unable to open Maxmind database file");
 }
 
 TEST_F(GeoipProviderTest, AllowMissingDatabaseRejectsInvalidDatabase) {

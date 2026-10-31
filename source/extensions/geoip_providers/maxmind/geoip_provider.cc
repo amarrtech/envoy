@@ -1,5 +1,6 @@
 #include "source/extensions/geoip_providers/maxmind/geoip_provider.h"
 
+#include <cerrno>
 #include <iterator>
 #include <span>
 
@@ -221,6 +222,14 @@ DbFileProvider::DbFileProvider(Event::Dispatcher& dispatcher, Stats::ScopeShared
     : stats_scope_(std::move(scope)), db_type_(db_type),
       stats_(generateDbFileStats(*stats_scope_, db_type, db_path)) {
   ASSERT(!db_path.empty());
+
+  // Register the watcher before the initial load so a database installed concurrently with
+  // startup cannot be missed between a failed open and watcher registration.
+  mmdb_watcher_ = dispatcher.createFilesystemWatcher();
+  THROW_IF_NOT_OK(
+      mmdb_watcher_->addWatch(db_path, Filesystem::Watcher::Events::MovedTo,
+                              [this, db_path](uint32_t) { return onMaxmindDbUpdate(db_path); }));
+
   absl::StatusOr<MaxmindDbSharedPtr> db_or_error = initMaxmindDb(db_path);
   ENVOY_BUG(!absl::IsResourceExhausted(db_or_error.status()),
             "Cannot open Maxmind database due to resource exhaustion");
@@ -234,11 +243,6 @@ DbFileProvider::DbFileProvider(Event::Dispatcher& dispatcher, Stats::ScopeShared
   } else {
     db_ = std::move(db_or_error.value());
   }
-
-  mmdb_watcher_ = dispatcher.createFilesystemWatcher();
-  THROW_IF_NOT_OK(
-      mmdb_watcher_->addWatch(db_path, Filesystem::Watcher::Events::MovedTo,
-                              [this, db_path](uint32_t) { return onMaxmindDbUpdate(db_path); }));
 }
 
 MaxmindDbSharedPtr DbFileProvider::db() const ABSL_LOCKS_EXCLUDED(mmdb_mutex_) {
@@ -253,15 +257,18 @@ void DbFileProvider::updateDb(MaxmindDbSharedPtr db) ABSL_LOCKS_EXCLUDED(mmdb_mu
 
 absl::StatusOr<MaxmindDbSharedPtr> DbFileProvider::initMaxmindDb(const std::string& db_path) {
   MMDB_s maxmind_db;
+  errno = 0;
   const int result_code = MMDB_open(db_path.c_str(), MMDB_MODE_MMAP, &maxmind_db);
+  const int error_number = errno;
   if (MMDB_SUCCESS != result_code) {
     const std::string error_msg = fmt::format("Unable to open Maxmind database file {}. Error {}",
                                               db_path, MMDB_strerror(result_code));
     if (result_code == MMDB_OUT_OF_MEMORY_ERROR) {
       return absl::ResourceExhaustedError(error_msg);
     }
-    return result_code == MMDB_FILE_OPEN_ERROR ? absl::NotFoundError(error_msg)
-                                               : absl::InvalidArgumentError(error_msg);
+    return result_code == MMDB_FILE_OPEN_ERROR && error_number == ENOENT
+               ? absl::NotFoundError(error_msg)
+               : absl::InvalidArgumentError(error_msg);
   }
 
   setDbBuildEpoch(maxmind_db.metadata.build_epoch);
